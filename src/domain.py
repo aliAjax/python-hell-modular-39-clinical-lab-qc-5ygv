@@ -22,6 +22,10 @@ class NotFoundError(DomainError):
 class ConflictError(DomainError):
     """A uniqueness or version constraint was violated."""
 
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details
+
 
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""

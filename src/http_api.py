@@ -70,7 +70,11 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -103,6 +107,28 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 3 and parts[:2] == ["api", "instruments"] and parts[2] == "freeze":
+                    body = self._body()
+                    instrument_id = body.pop("instrument_id", None)
+                    return self._send(
+                        200,
+                        service.report_freeze(
+                            actor,
+                            instrument_id,
+                            body.pop("reason", None),
+                            cause=body.pop("cause", None),
+                            cause_key=body.pop("cause_key", None),
+                            idempotency_key=self.headers.get("Idempotency-Key"),
+                        ),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "freeze_orders"] and parts[3] == "resume":
+                    return self._send(200, service.resume_freeze(actor, parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "freeze_orders"] and parts[3] == "recover":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.recover_freeze(actor, parts[2], body.pop("fresh_qc_run_id", None)),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

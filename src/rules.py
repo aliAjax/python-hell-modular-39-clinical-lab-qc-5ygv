@@ -153,18 +153,68 @@ def _validate_evaluate(actor, entity, data, lookup):
 def _validate_release(actor, entity, data, lookup):
     run = _find_one(lookup, "qc_run", "id", entity["data"].get("qc_run_id"))
     instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
-    if not run or run["status"] != "accepted":
-        raise ConflictError("result batch can only be released with an accepted QC run")
-    if not instrument or instrument["status"] != "ready":
-        raise ConflictError("instrument is not ready")
+    blockers = []
+    if not instrument:
+        raise ConflictError("instrument does not exist")
+    if instrument["status"] != "ready":
+        blockers.append(
+            {"kind": "instrument", "id": instrument["id"], "reason": "instrument status is %s" % instrument["status"]}
+        )
+    active_orders = []
+    # Freeze orders block once this batch has actually been held, or when the instrument
+    # itself is under an active freeze (failure / calibration change).
+    held = entity["status"] in ("intercepted", "investigating")
+    instrument_frozen = any(
+        order["status"] in ("freezing", "frozen")
+        for order in (lookup("freeze_order", "instrument_id", entity["data"].get("instrument_id")) or [])
+    )
+    if held or instrument_frozen:
+        for order in lookup("freeze_order", "instrument_id", entity["data"].get("instrument_id")) or []:
+            if order["status"] in ("freezing", "frozen"):
+                active_orders.append(order)
+                blockers.append(
+                    {
+                        "kind": "freeze_order",
+                        "id": order["id"],
+                        "cause": order["data"].get("cause"),
+                        "reason": order["data"].get("reason"),
+                    }
+                )
+    if held:
+        blockers.append(
+            {"kind": "result_batch", "id": entity["id"], "reason": "batch is already held: %s" % entity["status"]}
+        )
+    if run and run["status"] == "invalidated":
+        blockers.append(
+            {
+                "kind": "qc_run",
+                "id": run["id"],
+                "reason": "qc result was invalidated by a freeze order",
+            }
+        )
+    elif not run or run["status"] != "accepted":
+        if not blockers:
+            raise ConflictError("result batch can only be released with an accepted QC run")
+        blockers.append(
+            {"kind": "qc_run", "id": entity["data"].get("qc_run_id"), "reason": "qc run is not accepted"}
+        )
+    if not held and not instrument_frozen:
+        for batch in lookup("result_batch", "instrument_id", entity["data"].get("instrument_id")) or []:
+            if batch["id"] != entity["id"] and batch["status"] == "intercepted":
+                blockers.append(
+                    {
+                        "kind": "result_batch",
+                        "id": batch["id"],
+                        "reason": "intercepted result batch is not resolved",
+                    }
+                )
+    if blockers:
+        raise ConflictError(
+            "result batch is blocked while the instrument is frozen",
+            details={"state": "frozen", "blockers": blockers},
+        )
     if not calibration_is_valid(instrument["data"].get("calibration_due"), entity["data"].get("run_at")):
         raise ConflictError("instrument calibration is not valid at result time")
-    active_holds = []
-    for batch in lookup("result_batch", "instrument_id", entity["data"].get("instrument_id")) or []:
-        if batch["id"] != entity["id"] and batch["status"] == "intercepted":
-            active_holds.append(batch)
-    if active_holds:
-        raise ConflictError("an intercepted result batch must be resolved first")
     return {"released_by": actor.user_id}
 
 
@@ -201,6 +251,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "freeze_orders": "freeze_order",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +259,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "freeze_order": "freezing",
     }
     TRANSITIONS = {
         "assay": {
@@ -231,15 +283,20 @@ class RuleEngine:
             "retest": (("rejected",), "retesting"),
             "investigate": (("rejected",), "investigated"),
             "resolve": (("investigated", "retesting"), "resolved"),
+            "invalidate": (("accepted",), "invalidated"),
             "correct": (("accepted", "rejected", "investigated", "resolved"), "pending"),
         },
         "result_batch": {
             "release": (("waiting",), "released"),
-            "intercept": (("waiting",), "intercepted"),
+            "intercept": (("waiting", "quarantining"), "intercepted"),
             "retest": (("intercepted",), "waiting"),
+            "reassess": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "freeze_order": {
+            "recover": (("frozen",), "recovered"),
         },
     }
     CREATE_REQUIRED = {
@@ -265,9 +322,12 @@ class RuleEngine:
         ("result_batch", "release"): ("reviewer_id",),
         ("result_batch", "intercept"): ("reason",),
         ("result_batch", "retest"): ("replacement_run_id", "reason"),
+        ("result_batch", "reassess"): ("fresh_qc_run_id",),
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("qc_run", "invalidate"): ("reason", "freeze_order_id"),
+        ("freeze_order", "recover"): ("recovered_by",),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -292,6 +352,11 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "reassess": ("supervisor", "admin"),
+        "invalidate": ("operator", "supervisor", "admin"),
+        "freeze": ("operator", "supervisor", "admin"),
+        "resume": ("operator", "supervisor", "admin"),
+        "recover": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -323,6 +388,12 @@ class RuleEngine:
         if actor.role not in allowed:
             raise PermissionDenied("role %s is not allowed here" % actor.role)
 
+    @classmethod
+    def authorize_action(cls, actor, kind, action):
+        kind = cls.ALIASES.get(kind, kind)
+        allowed_roles = cls.ROLE_ACTIONS.get((kind, action), cls.ROLE_ACTIONS.get(action, ("admin",)))
+        cls._ensure_role(actor, allowed_roles)
+
     @staticmethod
     def _require(data, fields):
         for field in fields:
@@ -335,6 +406,8 @@ class RuleEngine:
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
+        if kind == "freeze_order":
+            raise ValidationError("freeze orders must be opened through the freeze report endpoint")
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = self.CUSTOM_CREATE.get(kind)
         return custom(actor, data, lookup) if custom else {}
@@ -346,6 +419,28 @@ class RuleEngine:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))
         allowed_statuses, next_status = transition
         if entity["status"] not in allowed_statuses:
+            # A later request racing an automatic interception must be answered against the
+            # frozen state rather than as an opaque state-machine error.
+            if kind == "result_batch" and action == "release":
+                blockers = []
+                if entity["status"] in ("intercepted", "investigating"):
+                    blockers.append(
+                        {"kind": "result_batch", "id": entity["id"], "reason": "batch is already held: %s" % entity["status"]}
+                    )
+                for order in lookup("freeze_order", "instrument_id", entity["data"].get("instrument_id")) or []:
+                    if order["status"] in ("freezing", "frozen"):
+                        blockers.append(
+                            {
+                                "kind": "freeze_order",
+                                "id": order["id"],
+                                "cause": order["data"].get("cause"),
+                                "reason": order["data"].get("reason"),
+                            }
+                        )
+                raise ConflictError(
+                    "result batch cannot be released from status %s" % entity["status"],
+                    details={"state": "frozen", "blockers": blockers},
+                )
             raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
         allowed_roles = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
         self._ensure_role(actor, allowed_roles)

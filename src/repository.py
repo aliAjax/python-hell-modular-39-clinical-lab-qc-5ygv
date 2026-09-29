@@ -140,6 +140,139 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def update_entity_guarded(self, entity_id, expected_version, status, data, status_guard=None):
+        """Conditional update that only applies while the current status is in ``status_guard``.
+
+        Returns the updated entity, or None when the guard no longer matches (a concurrent
+        transition won the race). This keeps freeze and release serialization safe across
+        processes; the in-process lock only orders requests, SQLite decides the winner.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, version FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            current_status = row["status"]
+            current_version = int(row["version"])
+            if status_guard is not None and current_status not in status_guard:
+                connection.rollback()
+                return None
+            if expected_version is not None and current_version != int(expected_version):
+                connection.rollback()
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ?",
+                (status, payload, now, entity_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
+    def claim_and_intercept_batch(self, batch_id, data):
+        """Atomically move a ``waiting`` batch straight to ``intercepted``.
+
+        Returns the updated entity, ``"released"`` when a concurrent release committed
+        first, or None when the batch is in another non-claimable state. The conditional
+        UPDATE runs under ``BEGIN IMMEDIATE`` and therefore cannot interleave with
+        :meth:`release_batch_atomically` — SQLite write transactions serialize the race.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM entities WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if not row:
+                connection.rollback()
+                raise NotFoundError("entity not found: " + batch_id)
+            status = row["status"]
+            if status == "released":
+                connection.rollback()
+                return "released"
+            if status == "intercepted":
+                connection.rollback()
+                return self.get_entity(batch_id)
+            if status != "waiting":
+                connection.rollback()
+                return None
+            connection.execute(
+                "UPDATE entities SET status = 'intercepted', version = version + 1, data = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'waiting'",
+                (payload, now, batch_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(batch_id)
+
+    def release_batch_atomically(self, batch_id, expected_version, validate):
+        """Validate and release a result batch inside one ``BEGIN IMMEDIATE`` transaction.
+
+        ``validate(connection, batch)`` raises to abort or returns the merged data payload
+        to persist. Because validation and the conditional UPDATE share the transaction, a
+        freeze cannot slip between the admissibility check and the release commit.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if not row:
+                connection.rollback()
+                raise NotFoundError("entity not found: " + batch_id)
+            batch = self._entity_from_row(row)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                connection.rollback()
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+            merged = validate(connection, batch)
+            payload = json.dumps(merged, ensure_ascii=False, sort_keys=True)
+            cursor = connection.execute(
+                "UPDATE entities SET status = 'released', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'waiting'",
+                (payload, utcnow(), batch_id),
+            )
+            if cursor.rowcount == 0:
+                connection.rollback()
+                raise ConflictError(
+                    "result batch cannot be released: it is already held by a freeze",
+                    details={
+                        "state": "frozen",
+                        "blockers": [
+                            {"kind": "result_batch", "id": batch_id, "reason": "batch is already held"}
+                        ],
+                    },
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(batch_id)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

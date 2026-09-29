@@ -14,13 +14,16 @@
 <body>
 <main>
   <h1>临床实验室质量控制与结果拦截</h1>
-  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。</p>
+  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。仪器故障或校准日期变动会自动开出冻结单：失效旧质控、拦截未出科批次；校准恢复并重新质控后可重评受影响批次。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 POST /api/entities/&lt;id&gt;/actions
+POST /api/instruments/freeze
+POST /api/freeze_orders/&lt;id&gt;/resume
+POST /api/freeze_orders/&lt;id&gt;/recover
 GET  /api/audit</pre>
 </main>
 <script>
