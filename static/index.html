@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>临床实验室质量控制与结果拦截</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
+    main { max-width: 860px; margin: auto; }
+    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+    button { padding: .5rem .8rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>临床实验室质量控制与结果拦截</h1>
+  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。</p>
+  <p><button onclick="checkHealth()">检查服务状态</button></p>
+  <pre id="result">等待操作</pre>
+  <pre>GET  /health
+GET  /api/&lt;kind&gt;
+POST /api/&lt;kind&gt;
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/audit</pre>
+</main>
+<script>
+async function checkHealth() {
+  const response = await fetch('/health');
+  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+}
+</script>
+</body>
+</html>
