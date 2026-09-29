@@ -34,6 +34,13 @@ class SQLiteRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_entities_kind_status
                     ON entities(kind, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_freeze_order_open_unique
+                    ON entities(
+                        kind,
+                        json_extract(data, '$.instrument_id'),
+                        json_extract(data, '$.reason')
+                    )
+                    WHERE kind = 'freeze_order' AND status = 'open';
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_id TEXT NOT NULL,

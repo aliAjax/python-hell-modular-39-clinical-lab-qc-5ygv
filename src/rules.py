@@ -97,6 +97,21 @@ def _validate_instrument(actor, data, lookup):
     return {"calibration_due": data.get("calibration_due")}
 
 
+def _validate_freeze_order(actor, data, lookup):
+    if not _find_one(lookup, "instrument", "id", data.get("instrument_id")):
+        raise ValidationError("instrument does not exist")
+    if not str(data.get("reason", "")).strip():
+        raise ValidationError("freeze reason is required")
+    return {}
+
+
+def _open_freeze(lookup, instrument_id):
+    for order in lookup("freeze_order", "instrument_id", instrument_id) or []:
+        if order["status"] == "open":
+            return order
+    return None
+
+
 def _validate_qc_run(actor, data, lookup):
     assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
     lot = _find_one(lookup, "qc_lot", "id", data.get("qc_lot_id"))
@@ -153,12 +168,35 @@ def _validate_evaluate(actor, entity, data, lookup):
 def _validate_release(actor, entity, data, lookup):
     run = _find_one(lookup, "qc_run", "id", entity["data"].get("qc_run_id"))
     instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
-    if not run or run["status"] != "accepted":
-        raise ConflictError("result batch can only be released with an accepted QC run")
     if not instrument or instrument["status"] != "ready":
         raise ConflictError("instrument is not ready")
+    freeze = _open_freeze(lookup, entity["data"].get("instrument_id"))
+    if entity["status"] == "intercepted":
+        if freeze:
+            raise ConflictError(
+                "instrument is under an open freeze order; release is blocked",
+                {
+                    "freeze_order_id": freeze["id"],
+                    "reason": freeze["data"].get("reason"),
+                    "items": freeze["data"].get("items", []),
+                },
+            )
+        raise ConflictError("intercepted result batch must be resolved before release")
+    if entity["status"] != "waiting":
+        raise ConflictError("result batch cannot be released from status %s" % entity["status"])
+    if not run or run["status"] != "accepted":
+        raise ConflictError("result batch can only be released with an accepted QC run")
     if not calibration_is_valid(instrument["data"].get("calibration_due"), entity["data"].get("run_at")):
         raise ConflictError("instrument calibration is not valid at result time")
+    if freeze:
+        raise ConflictError(
+            "instrument is under an open freeze order; release is blocked",
+            {
+                "freeze_order_id": freeze["id"],
+                "reason": freeze["data"].get("reason"),
+                "items": freeze["data"].get("items", []),
+            },
+        )
     active_holds = []
     for batch in lookup("result_batch", "instrument_id", entity["data"].get("instrument_id")) or []:
         if batch["id"] != entity["id"] and batch["status"] == "intercepted":
@@ -201,6 +239,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "freeze_orders": "freeze_order",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +247,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "freeze_order": "open",
     }
     TRANSITIONS = {
         "assay": {
@@ -232,14 +272,20 @@ class RuleEngine:
             "investigate": (("rejected",), "investigated"),
             "resolve": (("investigated", "retesting"), "resolved"),
             "correct": (("accepted", "rejected", "investigated", "resolved"), "pending"),
+            "void": (("pending", "accepted", "rejected", "retesting", "investigated", "resolved"), "voided"),
         },
         "result_batch": {
-            "release": (("waiting",), "released"),
+            "release": (("waiting", "intercepted"), "released"),
             "intercept": (("waiting",), "intercepted"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
+            "reevaluate": (("intercepted", "investigating", "resolved"), "waiting"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "freeze_order": {
+            "apply": (("open",), "open"),
+            "recover": (("open",), "recovered"),
         },
     }
     CREATE_REQUIRED = {
@@ -248,6 +294,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "freeze_order": ("instrument_id", "reason"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -275,6 +322,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "freeze_order": ("operator", "supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +340,10 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "void": ("operator", "supervisor", "admin"),
+        "reevaluate": ("supervisor", "admin"),
+        "apply": ("operator", "supervisor", "admin"),
+        "recover": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +351,7 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "freeze_order": _validate_freeze_order,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
